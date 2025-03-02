@@ -15,6 +15,7 @@ import argparse
 import glob
 from pathlib import Path
 from tabulate import tabulate
+from datetime import datetime
 
 def loading_spinner():
     spinner = ['|', '/', '-', '\\']
@@ -301,67 +302,49 @@ def build_vector_store(documents, db_path, cache_path="chat_vectorstore"):
     return vectorstore
 
 class ChatAnalyzer:
-    def __init__(self, vectorstore, chat_stats):
+    def __init__(self, vectorstore, chat_stats, db_path):
         print("\n🤖 Initializing chat model...")
         
-        # Create a system prompt that explains the data structure and expected behavior
-        system_prompt = """You are analyzing a Skype chat history database. The documents you have access to are of two types:
+        # Enhanced system prompt
+        system_prompt = """You are analyzing a Skype chat history database. When answering questions:
 
-1. Individual Messages:
-   - Each message includes metadata (Author, Date, Chat name, Chat type) and the actual message content
-   - Messages can be from either direct messages or group chats
-   - The metadata is structured in [Message Info] sections
-   - The actual message content follows in [Message Content] sections
-
-2. Conversation Summaries:
-   - These provide overview information about each chat
-   - Include participant lists, message counts, and date ranges
-   - Marked with [Conversation Summary] headers
-
-When answering questions:
-- For questions about specific people, look for their names in both Author fields and message content
-- For questions about specific conversations, use the Chat/conversation_name fields and Conversation Summaries
-- For timeline questions, pay attention to the Date fields
-- When summarizing conversations, combine information from both the Conversation Summary and relevant messages
-- If asked about a specific time period, filter by the dates in the metadata
-- Always mention whether information comes from direct messages or group chats when relevant
-- If you're not sure about something, say so rather than making assumptions
+1. Always include specific message quotes when relevant
+2. For each quote, include:
+   - The author's name
+   - The approximate date (if known)
+   - The conversation context
+3. Use the following format for quotes:
+   > [Author] at [timestamp] in [Conversation]: "[Exact message text]"
+4. When summarizing, include key quotes that support your summary
+5. If you're referring to multiple messages, list them clearly
+6. Always maintain the original wording of messages
+7. If you're unsure about a message's context, say so
 
 The chat history spans from {first_date} to {last_date} and includes messages from {num_participants} participants across {num_conversations} conversations."""
 
-        # Create a template that combines the system prompt with the user's question
+        # Enhanced query template
         prompt_template = """
 {system_prompt}
 
 Question: {query}
 
-Please analyze the relevant messages and provide a detailed answer.
+Please analyze the relevant messages and provide a detailed answer, including specific message quotes where appropriate.
 """
-        
+
         retriever = vectorstore.as_retriever(
-            search_type="mmr",  # Use maximum marginal relevance
+            search_type="mmr",
             search_kwargs={
-                "k": 10,  # Fetch more documents
-                "fetch_k": 20,  # Consider more candidates
-                "lambda_mult": 0.7  # Balance relevance with diversity
+                "k": 10,
+                "fetch_k": 20,
+                "lambda_mult": 0.7
             }
         )
 
-        # Get basic stats for the system prompt
-        first_doc = vectorstore.similarity_search("", k=1)[0]
-        stats = {
-            "first_date": first_doc.metadata.get("date", "unknown date"),
-            "last_date": "present",  # You might want to get this from your database
-            "num_participants": "multiple",  # Could be calculated from your database
-            "num_conversations": "several"  # Could be calculated from your database
-        }
-        
-        # Initialize the QA chain with the prompt template
         self.qa_chain = RetrievalQA.from_chain_type(
             llm=OllamaLLM(
                 model="mistral",
                 temperature=0.7,
-                system=system_prompt.format(**stats)
+                system=system_prompt.format(**chat_stats)
             ),
             retriever=retriever,
             chain_type="stuff",
@@ -369,11 +352,31 @@ Please analyze the relevant messages and provide a detailed answer.
         )
         print("✓ Chat model ready")
 
+        self.conversation_history = []
+        self.last_references = []
+        self.vectorstore = vectorstore
+        self.db_path = db_path  # Store database path for context queries
+
     def query(self, question):
         print("\n🔄 Processing your question...")
         spinner = loading_spinner()
         i = 0
         response = ""
+        
+        # Build context from conversation history
+        context = "\n".join(
+            f"Q: {q}\nA: {a}" 
+            for q, a in self.conversation_history[-3:]  # Keep last 3 Q/A pairs
+        )
+        
+        # Enhanced prompt with conversation history
+        full_prompt = f"""
+{context}
+
+Current Question: {question}
+
+Please consider the conversation history above when answering.
+"""
         
         def spinning_cursor():
             sys.stdout.write('\r' + f"Thinking {spinner[i%4]}")
@@ -382,11 +385,123 @@ Please analyze the relevant messages and provide a detailed answer.
         while not response:
             spinning_cursor()
             i += 1
-            result = self.qa_chain.invoke({"query": question})
+            result = self.qa_chain.invoke({"query": full_prompt})
             response = result['result'] if isinstance(result, dict) else result
             time.sleep(0.1)
         
+        # Update conversation history
+        self.conversation_history.append((question, response))
+        
+        # Add source message references - FIXED VERSION
+        self.last_references = []  # Clear previous references
+        
+        # Check if source_documents exists in the result
+        if isinstance(result, dict) and 'source_documents' in result:
+            source_docs = result['source_documents']
+            response += "\n\nReferences:\n"
+            
+            for idx, doc in enumerate(source_docs[:3]):  # Show top 3 references
+                # Extract metadata safely
+                author = doc.metadata.get('author', 'Unknown')
+                date = doc.metadata.get('date', 'Unknown date')
+                conversation = doc.metadata.get('conversation', 'Unknown chat')
+                
+                # Add to response
+                response += f"- {author} in {conversation} ({date})\n"
+                
+                # Store for later retrieval
+                self.last_references.append({
+                    'author': author,
+                    'date': date,
+                    'conversation': conversation,
+                    'content': doc.page_content
+                })
+                
+            # Debug info
+            print(f"DEBUG: Stored {len(self.last_references)} references")
+        else:
+            print("DEBUG: No source_documents found in result")
+            # Print result structure to debug
+            if isinstance(result, dict):
+                print(f"DEBUG: Result keys: {list(result.keys())}")
+        
         sys.stdout.write('\r' + ' ' * 20 + '\r')  # Clear the spinner
+        return response
+
+    def get_full_message(self, reference_index=0):
+        """Get full content of a referenced message with context"""
+        if not self.last_references:
+            return "No recent references available"
+        
+        if reference_index >= len(self.last_references):
+            return "Invalid reference index"
+            
+        ref = self.last_references[reference_index]
+        
+        # Connect to the database to get context messages
+        conn = sqlite3.connect(self.db_path)
+        conn.text_factory = lambda b: b.decode(errors='ignore')
+        
+        # Parse the date to get a timestamp
+        try:
+            # Convert date string to timestamp for comparison
+            date_obj = datetime.strptime(ref['date'], '%Y-%m-%d %H:%M:%S')
+            timestamp = int(date_obj.timestamp())
+            
+            # Query for messages before and after in the same conversation
+            context_query = """
+            SELECT 
+                datetime(m.timestamp, 'unixepoch') AS date,
+                m.author,
+                m.body_xml AS message,
+                c.displayname as conversation_name,
+                CASE 
+                    WHEN c.displayname IS NULL THEN 'Direct Message'
+                    ELSE 'Group Chat'
+                END as chat_type
+            FROM Messages m
+            LEFT JOIN Conversations c ON m.convo_id = c.id
+            WHERE 
+                c.displayname = ? 
+                AND m.timestamp BETWEEN ? - 3600 AND ? + 3600  -- 1 hour before and after
+            ORDER BY m.timestamp
+            LIMIT 5;  -- Get a few messages for context
+            """
+            
+            # Use conversation name as filter
+            params = (ref['conversation'], timestamp, timestamp)
+            context_df = pd.read_sql_query(context_query, conn, params=params)
+        except Exception as e:
+            # Fallback if date parsing fails
+            context_df = pd.DataFrame()
+            print(f"Error getting context: {str(e)}")
+        
+        conn.close()
+        
+        if context_df.empty:
+            return f"""
+Full message:
+
+> {ref['author']} at {ref['date']} in {ref['conversation']}:
+{ref['content']}
+
+(No context messages found)
+"""
+        
+        # Build the response
+        response = "\nMessage context:\n"
+        target_content = ref['content']
+        
+        for _, msg in context_df.iterrows():
+            is_target = target_content in msg['message']
+            
+            response += f"""
+> {msg['author']} at {msg['date']} in {msg['conversation_name'] or 'Direct Message'}:
+{msg['message']}
+"""
+            if is_target:
+                response += "  <-- This is the message you asked about\n"
+        
         return response
 
 if __name__ == "__main__":
@@ -438,17 +553,36 @@ if __name__ == "__main__":
         "num_conversations": df['conversation_name'].nunique()
     }
     
-    analyzer = ChatAnalyzer(vectorstore, chat_stats)
+    analyzer = ChatAnalyzer(vectorstore, chat_stats, db_path)
     
     print("\n🤖 Chat system ready! You can now ask questions about your chat history.")
-    print("Type 'exit' or 'quit' to end the session.")
+    print("Commands:")
+    print("- Type 'full message' to see the complete text of the last referenced message")
+    print("- Type 'full message 2' to see the second last referenced message")
+    print("- Type 'exit' or 'quit' to end the session")
     print("=" * 50)
     
     while True:
-        question = input("\n❓ Ask a question about your chats: ")
-        if question.lower() in ["exit", "quit"]:
+        question = input("\n❓ Ask a question about your chats: ").strip().lower()
+        
+        if question in ["exit", "quit"]:
             print("\n👋 Goodbye!")
             break
+            
+        # Handle full message requests
+        if question.startswith("full message"):
+            try:
+                # Extract message number if specified
+                if len(question.split()) > 2:
+                    idx = int(question.split()[2]) - 1
+                else:
+                    idx = 0
+                print(analyzer.get_full_message(idx))
+                continue
+            except Exception as e:
+                print(f"Error showing message: {str(e)}")
+                continue
+                
         response = analyzer.query(question)
         print("\n💡 Response:")
         print(response)

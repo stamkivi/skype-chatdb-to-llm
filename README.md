@@ -43,7 +43,6 @@ ollama serve
 ```bash
 python main.py [path-to-your-skype-database.db]
 ```
-If you don't specify a database path, the script will look for `.db` files in the current directory.
 
 2. The tool will:
    - Load and analyze your chat database
@@ -57,9 +56,36 @@ If you don't specify a database path, the script will look for `.db` files in th
    - "What was discussed in May 2023?"
    - "Find all messages mentioning [specific topic]"
 
-4. Type 'exit' or 'quit' to end the session.
+4. After getting a response, you can:
+   - Type "full message" to see the complete text of the last referenced message
+   - Type "full message 2" to see the second last referenced message, etc
+   - Continue asking follow-up questions
+
+5. Type 'exit' or 'quit' to end the session.
 
 ## Example Questions
+
+❓ What did Alice say about the project in March 2023?
+💡 Response:
+Alice mentioned the project timeline on March 15th:
+> [Alice] on [2023-03-15] in [Direct Message]: "Let's discuss the project timeline next week"
+
+References:
+- Alice in Direct Message (2023-03-15)
+
+❓ full message
+💡 Response:
+Full message content:
+
+> Alice on 2023-03-15 in Direct Message:
+[Message Info]
+Author: Alice
+Date: 2023-03-15
+Chat: Direct Message
+Type: Direct Message
+
+[Message Content]
+Let's discuss the project timeline next week
 
 ## ⚠️ Database Compatibility Notice
 
