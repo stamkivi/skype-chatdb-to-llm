@@ -1,18 +1,9 @@
-# Database files
-*.db
-*.sqlite
-*.sqlite3
-
-# Vector store cache
-chat_vectorstore/
-
 # Python
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
 .Python
-env/
 build/
 develop-eggs/
 dist/
@@ -31,10 +22,16 @@ wheels/
 
 # Virtual Environment
 venv/
+env/
 ENV/
 
 # IDE
 .idea/
 .vscode/
 *.swp
-*.swo 
+*.swo
+
+# Project specific
+*.db
+chat_vectorstore/
+.DS_Store 
