@@ -34,4 +34,5 @@ ENV/
 # Project specific
 *.db
 chat_vectorstore/
+chat_export/
 .DS_Store 
